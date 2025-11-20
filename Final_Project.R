@@ -1,9 +1,12 @@
 library(sf)
 library(spatstat)
+library(spdep)
+library(spData)
 library(tidyverse)
 library(lubridate)
 library(rlang)
 library(fixest)
+library(modelsummary)
 
 # Load block group and MSA files
 
@@ -63,7 +66,7 @@ RTD.commuter.stations <- RTD.stations %>%
 
 # Create buffered treatment and control groups for event study
 
-control.treatment <- function(blckgrp, rail_stations, study_area, data, lehd, year, stdevs=3) {
+control.treatment <- function(blckgrp, rail_stations, study_area, data, lehd, year, stdevs=2) {
   # ---- CRS setup ----
   target_crs <- 26913  # UTM Zone 13N
   blckgrp <- st_transform(blckgrp, target_crs)
@@ -78,6 +81,7 @@ control.treatment <- function(blckgrp, rail_stations, study_area, data, lehd, ye
   center <- st_centroid(blckgrp)
   study_area_valid <- st_make_valid(st_union(study_area))
   rail_stations_valid <- st_make_valid(rail_stations.filtered)
+  rail_buffer <- st_buffer(rail_stations_valid, 1180) # buffer 1 standard deviation
   
   study_buffer <- st_buffer(study_area_valid, 200)
   win <- as.owin(st_union(study_buffer))
@@ -98,7 +102,7 @@ control.treatment <- function(blckgrp, rail_stations, study_area, data, lehd, ye
   
   blckgrp.dist <- blckgrp %>%
     mutate(
-      dist_to_rail = nn.df$dist,
+      center_dist_to_rail = nn.df$dist,
       nearest_station = rail_attrs$NAME[nn.df$which],
       nearest_route = rail_attrs$RAIL_LINE[nn.df$which],
       ref_date = rail_attrs$ref_date[nn.df$which]
@@ -108,11 +112,11 @@ control.treatment <- function(blckgrp, rail_stations, study_area, data, lehd, ye
   blckgrp.data <- inner_join(blckgrp.dist, data, by = c("GISJOIN" = "GISJOIN")) %>%
     mutate(
       treat = case_when(
-        dist_to_rail <= 805 + 375 * stdevs ~ 1,
+        center_dist_to_rail <= 805 + 375 * stdevs | lengths(st_intersects(blckgrp.dist, rail_buffer)) > 0 ~ 1,
         TRUE ~ 0
       ))
   
-  blckgrp.lehd.data <- left_join(blckgrp.data,lehd, by = c("GEOID10" = "GEOID10"))
+  blckgrp.lehd.data <- left_join(blckgrp.data,lehd, by = c("GEOID10" = "id"))
   
   return(blckgrp.lehd.data)
 }
@@ -155,17 +159,52 @@ denver.study.2020 <- control.treatment(blckgrp2020.denver,RTD.commuter.stations,
 denver.study.2021 <- control.treatment(blckgrp2020.denver,RTD.commuter.stations,denver2020,data.2021,lehd.2021,2021)
 denver.study.2022 <- control.treatment(blckgrp2020.denver,RTD.commuter.stations,denver2020,data.2022,lehd.2022,2022)
 
+# Expected value functions for discrete values of rent and travel times
+
+gmr <- function(data, rent, expand = TRUE) {
+  if (expand == FALSE) {
+    values <- c(50,124.5,174.5,224.5,274.5,324.5,374.5,424.5,474.5,524.5,
+                574.5,624.5,674.5,724.5,774.5,849.5,949.5,1124.5,1374.5,
+                1749.5,2750)
+    suffixes <- sprintf("%03d", 3:23)
+  } else {
+    values <- c(50,124.5,174.5,224.5,274.5,324.5,374.5,424.5,474.5,524.5,
+                574.5,624.5,674.5,724.5,774.5,849.5,949.5,1124.5,1374.5,
+                1749.5,2249.5,2749.5,3249.5,3749.5)
+    suffixes <- sprintf("%03d", 3:26)
+  }
+  
+  counts <- sapply(paste0(rent, suffixes), function(col) data[[col]])
+  total <- data[[paste0(rent, "002")]]
+  probs <- counts / total
+  sum(values * probs, na.rm = TRUE)
+}
+
+travel <- function(data, traveltime) {
+  values <- c(2.5,7,12,17,22,27,32,37,42,57,74.5,100)
+  suffixes <- sprintf("%03d", 2:13)
+  counts <- sapply(paste0(traveltime, suffixes), function(col) data[[col]])
+  total <- data[[paste0(traveltime, "001")]]
+  probs <- counts / total
+  sum(values * probs, na.rm = TRUE)
+}
+
 # Create regression variables
 
 denver.regression.vars.2013 <- denver.study.2013 %>%
-  mutate(UHDE001 = as.numeric(UHDE001), UMME001 = as.numeric(UMME001)) %>%
+  mutate(UHDE001 = as.numeric(UHDE001), UMME001 = as.numeric(UMME001)) %>% # Make sure mhi and medvalhu are numeric
   mutate(lpop = log(UEPE001), lpdensity = log(UEPE001/ALAND10), pct_transit = UFFE010/UFHE001, 
          lmhi = log(UHDE001), pct_unem = UJ8E005/UJ8E003, lhousing = log(UKNE001), 
-         lmedvalhu = log(UMME001),ljobs = log(c000), ljobdensity = log(c000/ALAND10), 
-         lhpjobs = log(ce03)) %>%
-  select(GISJOIN,dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
-         lpop,lpdensity,pct_transit,lmhi,pct_unem,lhousing,lmedvalhu,ljobs,
-         ljobdensity,lhpjobs,geometry)
+         lmedvalhu = log(UMME001),ljobs = log(c000), 
+         ljobdensity = log(c000/ALAND10), lhpjobs = log(ce03)) %>% # Create regression vars
+  rowwise() %>%
+  mutate(lrent = log(gmr(cur_data(), "UL8E", expand = FALSE)), 
+         ltravel = log(travel(cur_data(), "UFHE"))) %>% # Run expected value functions for rent & travel time
+  ungroup() %>%
+  select(GISJOIN,center_dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
+         lpop,lpdensity,pct_transit,ltravel,lmhi,lrent,pct_unem,lhousing,lmedvalhu,ljobs,
+         ljobdensity,lhpjobs,INTPTLAT10,INTPTLON10,Shape_area,
+         Shape_len,geometry) # Select interest variables and fixed effects
 
 denver.regression.vars.2014 <- denver.study.2014 %>%
   mutate(ABDPE001 = as.numeric(ABDPE001), ABITE001 = as.numeric(ABITE001)) %>%
@@ -173,9 +212,14 @@ denver.regression.vars.2014 <- denver.study.2014 %>%
          lmhi = log(ABDPE001), pct_unem = ABGFE005/ABGFE003, lhousing = log(ABGWE001), 
          lmedvalhu = log(ABITE001),ljobs = log(c000), ljobdensity = log(c000/ALAND10), 
          lhpjobs = log(ce03)) %>%
-  select(GISJOIN,dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
-         lpop,lpdensity,pct_transit,lmhi,pct_unem,lhousing,lmedvalhu,ljobs,
-         ljobdensity,lhpjobs,geometry)
+  rowwise() %>%
+  mutate(lrent = log(gmr(cur_data(), "ABIGE", expand = FALSE)), 
+         ltravel = log(travel(cur_data(), "ABBTE"))) %>%
+  ungroup() %>%
+  select(GISJOIN,center_dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
+         lpop,lpdensity,pct_transit,ltravel,lmhi,lrent,pct_unem,lhousing,lmedvalhu,ljobs,
+         ljobdensity,lhpjobs,INTPTLAT10,INTPTLON10,Shape_area,
+         Shape_len,geometry) # Select interest variables and fixed effects
 
 denver.regression.vars.2015 <- denver.study.2015 %>%
   mutate(ADNKE001 = as.numeric(ADNKE001), ADRWE001 = as.numeric(ADRWE001)) %>%
@@ -183,9 +227,14 @@ denver.regression.vars.2015 <- denver.study.2015 %>%
          lmhi = log(ADNKE001), pct_unem = ADPIE005/ADPIE003, lhousing = log(ADPZE001), 
          lmedvalhu = log(ADRWE001),ljobs = log(c000), ljobdensity = log(c000/ALAND10), 
          lhpjobs = log(ce03)) %>%
-  select(GISJOIN,dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
-         lpop,lpdensity,pct_transit,lmhi,pct_unem,lhousing,lmedvalhu,ljobs,
-         ljobdensity,lhpjobs,geometry)
+  rowwise() %>%
+  mutate(lrent = log(gmr(cur_data(), "ADRJE")), 
+         ltravel = log(travel(cur_data(), "ADLOE"))) %>%
+  ungroup() %>%
+  select(GISJOIN,center_dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
+         lpop,lpdensity,pct_transit,ltravel,lmhi,lrent,pct_unem,lhousing,lmedvalhu,ljobs,
+         ljobdensity,lhpjobs,INTPTLAT10,INTPTLON10,Shape_area,
+         Shape_len,geometry) # Select interest variables and fixed effects
 
 denver.regression.vars.2016 <- denver.study.2016 %>%
   mutate(AF49E001 = as.numeric(AF49E001), AF9LE001 = as.numeric(AF9LE001)) %>%
@@ -193,9 +242,14 @@ denver.regression.vars.2016 <- denver.study.2016 %>%
          lmhi = log(AF49E001), pct_unem = AF67E005/AF67E003, lhousing = log(AF7OE001), 
          lmedvalhu = log(AF9LE001),ljobs = log(c000), ljobdensity = log(c000/ALAND10), 
          lhpjobs = log(ce03)) %>%
-  select(GISJOIN,dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
-         lpop,lpdensity,pct_transit,lmhi,pct_unem,lhousing,lmedvalhu,ljobs,
-         ljobdensity,lhpjobs,geometry)
+  rowwise() %>%
+  mutate(lrent = log(gmr(cur_data(), "AF88E")), 
+         ltravel = log(travel(cur_data(), "AF3DE"))) %>%
+  ungroup() %>%
+  select(GISJOIN,center_dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
+         lpop,lpdensity,pct_transit,ltravel,lmhi,lrent,pct_unem,lhousing,lmedvalhu,ljobs,
+         ljobdensity,lhpjobs,INTPTLAT10,INTPTLON10,Shape_area,
+         Shape_len,geometry) # Select interest variables and fixed effects
 
 denver.regression.vars.2017 <- denver.study.2017 %>%
   mutate(AH1PE001 = as.numeric(AH1PE001), AH53E001 = as.numeric(AH53E001)) %>%
@@ -203,9 +257,14 @@ denver.regression.vars.2017 <- denver.study.2017 %>%
          lmhi = log(AH1PE001), pct_unem = AH3PE005/AH3PE003, lhousing = log(AH36E001), 
          lmedvalhu = log(AH53E001),ljobs = log(c000), ljobdensity = log(c000/ALAND10), 
          lhpjobs = log(ce03)) %>%
-  select(GISJOIN,dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
-         lpop,lpdensity,pct_transit,lmhi,pct_unem,lhousing,lmedvalhu,ljobs,
-         ljobdensity,lhpjobs,geometry)
+  rowwise() %>%
+  mutate(lrent = log(gmr(cur_data(), "AH5QE")), 
+         ltravel = log(travel(cur_data(), "AHZTE"))) %>%
+  ungroup() %>%
+  select(GISJOIN,center_dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
+         lpop,lpdensity,pct_transit,ltravel,lmhi,lrent,pct_unem,lhousing,lmedvalhu,ljobs,
+         ljobdensity,lhpjobs,INTPTLAT10,INTPTLON10,Shape_area,
+         Shape_len,geometry) # Select interest variables and fixed effects
 
 denver.regression.vars.2018 <- denver.study.2018 %>%
   mutate(AJZAE001 = as.numeric(AJZAE001), AJ3QE001 = as.numeric(AJ3QE001)) %>%
@@ -213,9 +272,14 @@ denver.regression.vars.2018 <- denver.study.2018 %>%
          lmhi = log(AJZAE001), pct_unem = AJ1CE005/AJ1CE003, lhousing = log(AJ1TE001), 
          lmedvalhu = log(AJ3QE001),ljobs = log(c000), ljobdensity = log(c000/ALAND10), 
          lhpjobs = log(ce03)) %>%
-  select(GISJOIN,dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
-         lpop,lpdensity,pct_transit,lmhi,pct_unem,lhousing,lmedvalhu,ljobs,
-         ljobdensity,lhpjobs,geometry)
+  rowwise() %>%
+  mutate(lrent = log(gmr(cur_data(), "AJ3DE")), 
+         ltravel = log(travel(cur_data(), "AJXEE"))) %>%
+  ungroup() %>%
+  select(GISJOIN,center_dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
+         lpop,lpdensity,pct_transit,ltravel,lmhi,lrent,pct_unem,lhousing,lmedvalhu,ljobs,
+         ljobdensity,lhpjobs,INTPTLAT10,INTPTLON10,Shape_area,
+         Shape_len,geometry) # Select interest variables and fixed effects
 
 denver.regression.vars.2019 <- denver.study.2019 %>%
   mutate(ALW1E001 = as.numeric(ALW1E001), AL1HE001 = as.numeric(AL1HE001)) %>%
@@ -223,9 +287,14 @@ denver.regression.vars.2019 <- denver.study.2019 %>%
          lmhi = log(ALW1E001), pct_unem = ALY3E005/ALY3E003, lhousing = log(ALZKE001), 
          lmedvalhu = log(AL1HE001),ljobs = log(c000), ljobdensity = log(c000/ALAND10), 
          lhpjobs = log(ce03)) %>%
-  select(GISJOIN,dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
-         lpop,lpdensity,pct_transit,lmhi,pct_unem,lhousing,lmedvalhu,ljobs,
-         ljobdensity,lhpjobs,geometry)
+  rowwise() %>%
+  mutate(lrent = log(gmr(cur_data(), "AL04E")), 
+         ltravel = log(travel(cur_data(), "ALU3E"))) %>%
+  ungroup() %>%
+  select(GISJOIN,center_dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
+         lpop,lpdensity,pct_transit,ltravel,lmhi,lrent,pct_unem,lhousing,lmedvalhu,ljobs,
+         ljobdensity,lhpjobs,INTPTLAT10,INTPTLON10,Shape_area,
+         Shape_len,geometry) # Select interest variables and fixed effects
 
 denver.regression.vars.2020 <- denver.study.2020 %>%
   mutate(AMR8E001 = as.numeric(AMR8E001), AMWBE001 = as.numeric(AMWBE001)) %>%
@@ -233,9 +302,14 @@ denver.regression.vars.2020 <- denver.study.2020 %>%
          lmhi = log(AMR8E001), pct_unem = AMT9E005/AMT9E003, lhousing = log(AMUEE001), 
          lmedvalhu = log(AMWBE001),ljobs = log(c000), ljobdensity = log(c000/ALAND), 
          lhpjobs = log(ce03)) %>%
-  select(GISJOIN,dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
-         lpop,lpdensity,pct_transit,lmhi,pct_unem,lhousing,lmedvalhu,ljobs,
-         ljobdensity,lhpjobs,geometry)
+  rowwise() %>%
+  mutate(lrent = log(gmr(cur_data(), "AMVYE")), 
+         ltravel = log(travel(cur_data(), "AMQME"))) %>%
+  ungroup() %>%
+  select(GISJOIN,center_dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
+         lpop,lpdensity,pct_transit,ltravel,lmhi,lrent,pct_unem,lhousing,lmedvalhu,ljobs,
+         ljobdensity,lhpjobs,INTPTLAT,INTPTLON,Shape_Area,
+         Shape_Leng,geometry) # Select interest variables and fixed effects
 
 denver.regression.vars.2021 <- denver.study.2021 %>%
   mutate(AOQIE001 = as.numeric(AOQIE001), AOULE001 = as.numeric(AOULE001)) %>%
@@ -243,9 +317,14 @@ denver.regression.vars.2021 <- denver.study.2021 %>%
          lmhi = log(AOQIE001), pct_unem = AOSJE005/AOSJE003, lhousing = log(AOSOE001), 
          lmedvalhu = log(AOULE001),ljobs = log(c000), ljobdensity = log(c000/ALAND), 
          lhpjobs = log(ce03)) %>%
-  select(GISJOIN,dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
-         lpop,lpdensity,pct_transit,lmhi,pct_unem,lhousing,lmedvalhu,ljobs,
-         ljobdensity,lhpjobs,geometry)
+  rowwise() %>%
+  mutate(lrent = log(gmr(cur_data(), "AOT8E")), 
+         ltravel = log(travel(cur_data(), "AOOVE"))) %>%
+  ungroup() %>%
+  select(GISJOIN,center_dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
+         lpop,lpdensity,pct_transit,ltravel,lmhi,lrent,pct_unem,lhousing,lmedvalhu,ljobs,
+         ljobdensity,lhpjobs,INTPTLAT,INTPTLON,Shape_Area,
+         Shape_Leng,geometry) # Select interest variables and fixed effects
 
 denver.regression.vars.2022 <- denver.study.2022 %>%
   mutate(AQP6E001 = as.numeric(AQP6E001), AQU4E001 = as.numeric(AQU4E001)) %>%
@@ -253,11 +332,17 @@ denver.regression.vars.2022 <- denver.study.2022 %>%
          lmhi = log(AQP6E001), pct_unem = AQR8E005/AQR8E003, lhousing = log(AQSPE001), 
          lmedvalhu = log(AQU4E001),ljobs = log(c000), ljobdensity = log(c000/ALAND), 
          lhpjobs = log(ce03)) %>%
-  select(GISJOIN,dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
-         lpop,lpdensity,pct_transit,lmhi,pct_unem,lhousing,lmedvalhu,ljobs,
-         ljobdensity,lhpjobs,geometry)
+  rowwise() %>%
+  mutate(lrent = log(gmr(cur_data(), "AQURE")), 
+         ltravel = log(travel(cur_data(), "AQN7E"))) %>%
+  ungroup() %>%
+  select(GISJOIN,center_dist_to_rail,nearest_station,nearest_route,ref_date,YEAR,treat,
+         lpop,lpdensity,pct_transit,ltravel,lmhi,lrent,pct_unem,lhousing,lmedvalhu,ljobs,
+         ljobdensity,lhpjobs,INTPTLAT,INTPTLON,Shape_Area,
+         Shape_Leng,geometry) # Select interest variables and fixed effects
 
 # Bind rows
+
 denver.regression.set <- bind_rows(denver.regression.vars.2013,denver.regression.vars.2014,
                                    denver.regression.vars.2015,denver.regression.vars.2016,
                                    denver.regression.vars.2017,denver.regression.vars.2018,
@@ -265,11 +350,48 @@ denver.regression.set <- bind_rows(denver.regression.vars.2013,denver.regression
                                    denver.regression.vars.2021,denver.regression.vars.2022) %>%
   mutate(YEAR = as.numeric(strtrim(YEAR, 4)) + 4, event_time = YEAR - year(ref_date))
 
-# Event study regression
+# Regress the interest variables
 
-unemployment <- feols(pct_unem ~ i(event_time, treat, ref = 0) | GISJOIN + YEAR, data = denver.regression.set)
-jobs <- feols(ljobs ~ i(event_time, treat, ref = 0) | GISJOIN + YEAR, data = denver.regression.set)
-medvalhu <- feols(lmedvalhu ~ i(event_time, treat, ref = 0) | GISJOIN + YEAR, data = denver.regression.set)
-housing <- feols(lhousing ~ i(event_time, treat, ref = 0) | GISJOIN + YEAR, data = denver.regression.set)
-mhi <- feols(lmhi ~ i(event_time, treat, ref = 0) | GISJOIN + YEAR, data = denver.regression.set)
-hpjobs <- feols(lhpjobs ~ i(event_time, treat, ref = 0) | GISJOIN + YEAR, data = denver.regression.set)
+population <- feols(lpop ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+density <- feols(lpdensity ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+transit <- feols(pct_transit ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+commute_time <- feols(ltravel ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+mhi <- feols(lmhi ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+rent<- feols(lrent ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+unemployment <- feols(pct_unem ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+housing <- feols(lhousing ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+medvalhu <- feols(lmedvalhu ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+jobs <- feols(ljobs ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+high_paying_jobs <- feols(lhpjobs ~ i(event_time, treat, ref = -1) | GISJOIN + YEAR, data = denver.regression.set)
+
+coefplot(population)
+coefplot(density)
+coefplot(transit)
+coefplot(commute_time)
+coefplot(mhi)
+coefplot(rent)
+coefplot(unemployment)
+coefplot(housing)
+coefplot(medvalhu)
+coefplot(jobs)
+coefplot(high_paying_jobs)
+
+summary(population)
+summary(density)
+summary(transit)
+summary(commute_time)
+summary(mhi)
+summary(rent)
+summary(unemployment)
+summary(housing)
+summary(medvalhu)
+summary(jobs)
+summary(high_paying_jobs)
+
+models <- list(population,transit,commute_time,mhi,rent,unemployment,housing,medvalhu,
+               jobs,high_paying_jobs)
+names(models) <- c("Log Populataion","Percent of Commuters who Use Transit","Log Average Commute Time",
+           "Log Median Household Income","Log Gross Mean Rent","Percent of Unemployment",
+           "Log Total Housing Units","Log Median Value of a Housing Unit","Log Total Jobs",
+           "Log Jobs over $3,333 in Monthly Earnings")
+modelsummary(models, stars = TRUE)
